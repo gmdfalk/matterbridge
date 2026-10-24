@@ -131,9 +131,16 @@ export class MetricsServer {
     server.maxConnections = 8;
     this.server = server;
     return new Promise((resolve) => {
-      server.once('error', () => {
-        this.log.warn('Metrics listener failed; check its bind address and port');
-        this.server = undefined;
+      server.on('error', () => {
+        if (this.server === server) {
+          this.log.warn('Metrics listener failed; check its bind address and port');
+          this.server = undefined;
+        }
+        // Keep handling later errors and release the socket even after startup succeeded.
+        server.close(() => {
+          // Consume ERR_SERVER_NOT_RUNNING when startup failed before binding.
+        });
+        server.closeAllConnections();
         resolve(false);
       });
       server.listen(port, host, () => {

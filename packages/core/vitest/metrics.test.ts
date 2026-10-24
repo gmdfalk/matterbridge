@@ -4,7 +4,7 @@
  * @author Max Falk
  */
 
-import { createServer } from 'node:http';
+import { createServer, type Server } from 'node:http';
 
 import { getFreePort } from '@matterbridge/test-utils';
 import { Registry } from '@prometheus-io/client';
@@ -97,6 +97,32 @@ describe('native metrics', () => {
     failure.mockRestore();
     await metrics.close();
     await expect(fetch(`${url}/metrics`)).rejects.toThrow();
+  });
+
+  test('should release its socket and contain repeated listener errors after startup', async () => {
+    const port = await getFreePort();
+    metrics = new MetricsServer(snapshot, log);
+    expect(await metrics.start('127.0.0.1', port)).toBe(true);
+    // Inject an HTTP transport failure; it must not leak the port or escape to core.
+    const server = (metrics as unknown as { server: Server }).server;
+    expect(() => server.emit('error', new Error('runtime transport failure'))).not.toThrow();
+    expect(() => server.emit('error', new Error('repeated transport failure'))).not.toThrow();
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    const replacement = createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        replacement.once('error', reject);
+        replacement.listen(port, '127.0.0.1', resolve);
+      });
+    } finally {
+      await new Promise<void>((resolve) => {
+        replacement.close(() => {
+          resolve();
+        });
+      });
+    }
   });
 
   test('should keep bind errors and invalid configuration isolated from the application', async () => {

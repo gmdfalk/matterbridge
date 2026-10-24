@@ -35,6 +35,10 @@ If you like this project and find it useful, please consider giving it a star on
 
 - [metrics]: Add a disabled-by-default native metrics listener, optional plugin connection diagnostics and Matter fabric/session subscription counts.
 
+### Fixed
+
+- [metrics]: Keep node aliases stable across discovery order, coalesce concurrent failed startup and release sockets after listener errors.
+
 ## [3.11.0] - 2026-10-23
 
 ### Breaking changes

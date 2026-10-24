@@ -276,6 +276,19 @@ describe('Matterbridge', () => {
     await matterbridge.startMetrics({ ...base, metrics_enabled: true });
     expect((matterbridge as any).metrics).toBeUndefined();
     failing.mockRestore();
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    const delayedFailure = vi.spyOn(MetricsServer.prototype, 'start').mockReturnValue(promise);
+    try {
+      const attempts = [matterbridge.startMetrics({ ...base, metrics_enabled: true }), matterbridge.startMetrics({ ...base, metrics_enabled: true })];
+      await flushAsync();
+      resolve(false);
+      await Promise.all(attempts);
+      expect(delayedFailure).toHaveBeenCalledTimes(1);
+      expect((matterbridge as any).metrics).toBeUndefined();
+    } finally {
+      resolve(false);
+      delayedFailure.mockRestore();
+    }
     const port = await getFreePort();
     const config = { ...base, metrics_enabled: true, metrics_port: port };
     await Promise.all([matterbridge.startMetrics(config), matterbridge.startMetrics(config)]);
@@ -333,6 +346,25 @@ describe('Matterbridge', () => {
       expect(data.plugins[0].ready).toBe(true);
       expect(data.plugins[1].ready).toBe(false);
       expect(data.plugins[1].exports).toBe(0);
+      const first = { ...node, id: 'private-node-alpha', lifecycle: { isOnline: false } };
+      const second = { ...node, id: 'private-node-beta', lifecycle: { isOnline: true } };
+      devices.mockReturnValue([{ serverNode: first }, { serverNode: second }] as any);
+      const before = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      devices.mockReturnValue([{ serverNode: second }, { serverNode: first }] as any);
+      const after = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      expect(after).toEqual(before);
+      expect(JSON.stringify(after)).not.toContain('private-node');
+      plugins.mockReturnValue([
+        { name: 'alpha', serverNode: first },
+        { name: 'beta', serverNode: second },
+      ] as any);
+      const pluginBefore = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      plugins.mockReturnValue([
+        { name: 'beta', serverNode: second },
+        { name: 'alpha', serverNode: first },
+      ] as any);
+      const pluginAfter = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      expect(pluginAfter).toEqual(pluginBefore);
     } finally {
       plugins.mockRestore();
       devices.mockRestore();

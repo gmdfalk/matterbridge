@@ -27,6 +27,7 @@
 import '@matter/nodejs'; // Set up Node.js environment for matter.js
 
 // Node.js modules
+import { createHash } from 'node:crypto';
 import EventEmitter from 'node:events';
 import fs, { unlinkSync } from 'node:fs';
 import os from 'node:os';
@@ -408,7 +409,6 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
       this.log.warn('Native metrics are not yet supported by the experimental backend; household control continues');
       return;
     }
-    if (this.metricsStarting) await this.metricsStarting;
     const host = config.metrics_bind ?? '127.0.0.1';
     const port = config.metrics_port ?? 9490;
     if (typeof host !== 'string' || typeof port !== 'number') {
@@ -416,6 +416,11 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
       return;
     }
     const address = `${host}:${port}`;
+    if (this.metricsStarting) {
+      await this.metricsStarting;
+      if (this.metrics && this.metricsAddress !== address) this.log.warn('Metrics already enabled with different options; restart with consistent metrics options');
+      return;
+    }
     if (this.metrics) {
       if (this.metricsAddress !== address) this.log.warn('Metrics already enabled with different options; restart with consistent metrics options');
       return;
@@ -448,12 +453,14 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
     const plugins = this.plugins.array();
     const nodes: import('./metrics.js').MetricsNode[] = [];
     const observed = new Set<ServerNode>();
-    const addNode = (serverNode: ServerNode | undefined, alias: string): void => {
+    const addNode = (serverNode: ServerNode | undefined, alias?: string): void => {
       if (!serverNode || observed.has(serverNode)) return;
       observed.add(serverNode);
       const sessions = Object.values(serverNode.state.sessions.sessions);
       nodes.push({
-        node: alias,
+        // Hash standalone identity with the existing private instance UUID: stable across
+        // discovery order/restarts without exposing names, serials or raw node IDs.
+        node: alias ?? `standalone-${createHash('sha256').update(this.uuid).update('\0').update(serverNode.id).digest('hex').slice(0, 16)}`,
         online: serverNode.lifecycle.isOnline,
         fabrics: Object.values(serverNode.state.commissioning.fabrics).map((fabric) => {
           const active = sessions.filter((session) => session.isPeerActive && session.fabric?.fabricIndex === fabric.fabricIndex);
@@ -467,8 +474,8 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
       });
     };
     addNode(this.serverNode, 'root');
-    for (const [index, plugin] of plugins.entries()) addNode(plugin.serverNode, `plugin-${index + 1}`);
-    for (const [index, device] of this.devices.array().entries()) addNode(device.serverNode, `standalone-${index + 1}`);
+    for (const plugin of plugins) addNode(plugin.serverNode, `plugin-${plugin.name}`);
+    for (const device of this.devices.array()) addNode(device.serverNode);
     return {
       plugins: plugins.map((plugin) => ({
         name: plugin.name,
