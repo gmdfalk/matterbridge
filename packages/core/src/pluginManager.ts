@@ -3,7 +3,7 @@
  * @description This file contains the PluginManager class.
  * @author Luca Liguori
  * @created 2024-07-14
- * @version 1.4.0
+ * @version 1.4.1
  * @license Apache-2.0
  *
  * Copyright 2024, 2025, 2026 Luca Liguori.
@@ -1222,6 +1222,10 @@ export class PluginManager extends EventEmitter<PluginManagerEvents> {
     try {
       // Load the package.json of the plugin
       const packageJson = JSON.parse(await promises.readFile(plugin.path, 'utf8'));
+      const config: PlatformConfig = await this.loadConfig(plugin);
+      plugin.configJson = config;
+      // Start before importing plugin code so import/constructor failures remain observable.
+      await this.matterbridge.startMetrics(config);
       // Resolve the main module path relative to package.json
       const pluginEntry = path.resolve(path.dirname(plugin.path), packageJson.main);
       // Dynamically import the plugin
@@ -1234,8 +1238,6 @@ export class PluginManager extends EventEmitter<PluginManagerEvents> {
 
       // Call the default export function of the plugin, passing this MatterBridge instance, the log and the config
       if (pluginInstance.default) {
-        const config: PlatformConfig = await this.loadConfig(plugin);
-
         // Preset the plugin properties here in case the plugin throws an error during loading. In this case the user can change the config and restart the plugin.
         plugin.name = packageJson.name;
         plugin.description = this.getDescription(packageJson);

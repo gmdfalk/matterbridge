@@ -3,7 +3,7 @@
  * @description This file contains the class MatterbridgePlatform.
  * @author Luca Liguori
  * @created 2024-03-21
- * @version 1.6.7
+ * @version 1.6.8
  * @license Apache-2.0
  *
  * Copyright 2024, 2025, 2026 Luca Liguori.
@@ -51,7 +51,15 @@ logModuleLoaded('MatterbridgePlatform');
 // Module-private brand
 const MATTERBRIDGE_PLATFORM_BRAND = Symbol('MatterbridgePlatform.brand');
 
-export type { BasePlatformConfig, PlatformConfig, PlatformConfigValue, PlatformMatterbridge, PlatformSchema, PlatformSchemaValue } from '@matterbridge/types';
+export type {
+  PlatformConnectionHealth,
+  BasePlatformConfig,
+  PlatformConfig,
+  PlatformConfigValue,
+  PlatformMatterbridge,
+  PlatformSchema,
+  PlatformSchemaValue,
+} from '@matterbridge/types';
 
 /**
  * Type guard to check whether a value is a MatterbridgePlatform instance.
@@ -433,6 +441,14 @@ export class MatterbridgePlatform {
       `The plugin ${CYAN}${this.name}${db} doesn't override onAction. Received action ${CYAN}${action}${db}${value ? ' with ' + CYAN + value + db : ''} ${id ? ' for schema ' + CYAN + id + db : ''}`,
       formData,
     );
+  }
+
+  /**
+   * Read optional upstream connection health without performing network I/O
+   * @returns {import('@matterbridge/types').PlatformConnectionHealth | undefined} Current health, or undefined when unsupported or disabled.
+   */
+  getConnectionHealth(): import('@matterbridge/types').PlatformConnectionHealth | undefined {
+    return undefined;
   }
 
   /**
