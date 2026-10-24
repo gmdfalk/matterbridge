@@ -44,6 +44,8 @@ export type PlatformSchema = Record<string, PlatformSchemaValue>;
 
 /** A type representing a subset of readonly properties of Matterbridge for platform use. */
 export type PlatformMatterbridge = {
+  /** Whether core can serve native metrics for an opted-in plugin. */
+  readonly supportsNativeMetrics?: boolean;
   readonly systemInformation: Readonly<
     Pick<
       SystemInformation,
@@ -89,3 +91,13 @@ export type PlatformMatterbridge = {
   readonly aggregatorProductId: number;
   readonly aggregatorProductName: string;
 };
+
+/** Read-only health of a plugin's upstream connection, returned only when metrics are enabled. */
+export interface PlatformConnectionHealth {
+  /** Whether the current upstream connection is authenticated. */
+  connected: boolean;
+  /** Whether the current connection has an acknowledged event subscription. */
+  subscribed: boolean;
+  /** Unix seconds of the last matching application heartbeat, or zero if none. */
+  lastHeartbeatTimestampSeconds: number;
+}

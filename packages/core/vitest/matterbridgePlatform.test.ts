@@ -784,6 +784,10 @@ describe('Matterbridge platform', () => {
     expect(loggerLogSpy).toHaveBeenCalledWith(LogLevel.DEBUG, expect.stringContaining(`doesn't override onAction.`), undefined);
   });
 
+  test('should report unsupported connection health for an uninstrumented platform', () => {
+    expect(platform.getConnectionHealth()).toBeUndefined();
+  });
+
   test('onFetch should log a message and return undefined when not overridden', async () => {
     expect(await platform.onFetch('GET')).toBeUndefined();
     expect(await platform.onFetch('GET', 'myVar')).toBeUndefined();

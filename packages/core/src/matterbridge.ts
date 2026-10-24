@@ -3,7 +3,7 @@
  * @description This file contains the class Matterbridge.
  * @author Luca Liguori
  * @created 2023-12-29
- * @version 1.8.2
+ * @version 1.8.3
  * @license Apache-2.0
  *
  * Copyright 2023, 2024, 2025, 2026 Luca Liguori.
@@ -27,6 +27,7 @@
 import '@matter/nodejs'; // Set up Node.js environment for matter.js
 
 // Node.js modules
+import { createHash } from 'node:crypto';
 import EventEmitter from 'node:events';
 import fs, { unlinkSync } from 'node:fs';
 import os from 'node:os';
@@ -114,7 +115,7 @@ import { Frontend } from './frontend.js';
 import { addVirtualDevice, addVirtualDevices, resolveRootDirectory } from './helpers.js';
 import { bridge } from './matterbridgeDeviceTypes.js';
 import { MatterbridgeEndpoint } from './matterbridgeEndpoint.js';
-import { clearAdvertisingNodes, deleteAdvertisingNode, getServerNodeData, setAdvertisingNode } from './matterNodeHelpers.js';
+import { getVendorIdName, clearAdvertisingNodes, deleteAdvertisingNode, getServerNodeData, setAdvertisingNode } from './matterNodeHelpers.js';
 import { type Plugin, PluginManager } from './pluginManager.js';
 
 logModuleLoaded('Matterbridge');
@@ -278,6 +279,10 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
   private readonly failCountLimit = 300; // 5 minutes if check every second
   /** Whether the Matterbridge instance has started cleanup */
   public hasCleanupStarted = false;
+
+  private metrics?: import('./metrics.js').MetricsServer;
+  private metricsStarting?: Promise<void>;
+  private metricsAddress?: string;
   /** Whether the Matterbridge instance has been initialized */
   private initialized = false;
   /** Whether the Matterbridge instance is a shutdown command */
@@ -394,6 +399,95 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
   }
 
   /**
+   * Start an optional core-owned listener before an opted-in plugin initializes
+   * @param {import('@matterbridge/types').PlatformConfig} config Plugin options; absent/false metrics_enabled is a no-op.
+   * @returns {Promise<void>} Resolves even when optional metrics cannot start.
+   */
+  async startMetrics(config: import('@matterbridge/types').PlatformConfig): Promise<void> {
+    if (config.metrics_enabled !== true) return;
+    if (hasParameter('experimental-backend')) {
+      this.log.warn('Native metrics are not yet supported by the experimental backend; household control continues');
+      return;
+    }
+    const host = config.metrics_bind ?? '127.0.0.1';
+    const port = config.metrics_port ?? 9490;
+    if (typeof host !== 'string' || typeof port !== 'number') {
+      this.log.warn('Invalid metrics bind address or port; household control continues');
+      return;
+    }
+    const address = `${host}:${port}`;
+    if (this.metricsStarting) {
+      await this.metricsStarting;
+      if (this.metrics && this.metricsAddress !== address) this.log.warn('Metrics already enabled with different options; restart with consistent metrics options');
+      return;
+    }
+    if (this.metrics) {
+      if (this.metricsAddress !== address) this.log.warn('Metrics already enabled with different options; restart with consistent metrics options');
+      return;
+    }
+    this.metricsStarting = (async (): Promise<void> => {
+      try {
+        const { MetricsServer } = await import('./metrics.js');
+        const metrics = new MetricsServer(() => this.getMetricsSnapshot(), this.log);
+        if (await metrics.start(host, port)) {
+          this.metrics = metrics;
+          this.metricsAddress = address;
+          this.log.info('Native metrics listener enabled');
+        } else {
+          await metrics.close();
+          this.log.warn('Native metrics listener not started; household control continues');
+        }
+      } catch {
+        this.log.warn('Native metrics initialization failed; household control continues');
+      }
+    })();
+    await this.metricsStarting;
+    this.metricsStarting = undefined;
+  }
+
+  /**
+   * Read allowlisted local observations without requests to devices or HA
+   * @returns {import('./metrics.js').MetricsSnapshot} Current plugin, node and fabric observations.
+   */
+  private getMetricsSnapshot(): import('./metrics.js').MetricsSnapshot {
+    const plugins = this.plugins.array();
+    const nodes: import('./metrics.js').MetricsNode[] = [];
+    const observed = new Set<ServerNode>();
+    const addNode = (serverNode: ServerNode | undefined, alias?: string): void => {
+      if (!serverNode || observed.has(serverNode)) return;
+      observed.add(serverNode);
+      const sessions = Object.values(serverNode.state.sessions.sessions);
+      nodes.push({
+        // Hash standalone identity with the existing private instance UUID: stable across
+        // discovery order/restarts without exposing names, serials or raw node IDs.
+        node: alias ?? `standalone-${createHash('sha256').update(this.uuid).update('\0').update(serverNode.id).digest('hex').slice(0, 16)}`,
+        online: serverNode.lifecycle.isOnline,
+        fabrics: Object.values(serverNode.state.commissioning.fabrics).map((fabric) => {
+          const active = sessions.filter((session) => session.isPeerActive && session.fabric?.fabricIndex === fabric.fabricIndex);
+          return {
+            controller: `fabric-${fabric.fabricIndex}`,
+            vendor: getVendorIdName(fabric.rootVendorId),
+            sessions: active.length,
+            subscriptions: active.reduce((sum, session) => sum + session.numberOfActiveSubscriptions, 0),
+          };
+        }),
+      });
+    };
+    addNode(this.serverNode, 'root');
+    for (const plugin of plugins) addNode(plugin.serverNode, `plugin-${plugin.name}`);
+    for (const device of this.devices.array()) addNode(device.serverNode);
+    return {
+      plugins: plugins.map((plugin) => ({
+        name: plugin.name,
+        ready: Boolean(plugin.enabled && plugin.loaded && plugin.started && plugin.configured && !plugin.error),
+        exports: plugin.registeredDevices ?? 0,
+        connection: plugin.configJson?.metrics_enabled === true ? plugin.platform?.getConnectionHealth() : undefined,
+      })),
+      nodes,
+    };
+  }
+
+  /**
    * Get a platform matterbridge object
    *
    * @returns {PlatformMatterbridge} The platform matterbridge object.
@@ -417,6 +511,7 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
       matterbridgePluginDirectory: this.matterbridgePluginDirectory,
       matterbridgeCertDirectory: this.matterbridgeCertDirectory,
       globalModulesDirectory: this.globalModulesDirectory,
+      supportsNativeMetrics: !hasParameter('experimental-backend'),
       matterbridgeVersion: this.matterbridgeVersion,
       matterbridgeLatestVersion: this.matterbridgeLatestVersion,
       matterbridgeDevVersion: this.matterbridgeDevVersion,
@@ -1920,6 +2015,10 @@ export class Matterbridge extends EventEmitter<MatterbridgeEvents> {
     if (this.initialized && !this.hasCleanupStarted) {
       this.emit('cleanup_started');
       this.hasCleanupStarted = true;
+      await this.metricsStarting;
+      await this.metrics?.close();
+      this.metrics = undefined;
+      this.metricsAddress = undefined;
       this.log.info(message);
 
       // Notify the frontend that Matterbridge is stopping

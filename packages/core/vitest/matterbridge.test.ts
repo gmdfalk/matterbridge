@@ -22,7 +22,7 @@ import { Logger, LogLevel as MatterLogLevel } from '@matter/general';
 import type { ServerNode } from '@matter/node';
 import { PowerSourceServer } from '@matter/node/behaviors/power-source';
 import { PowerSource } from '@matter/types/clusters/power-source';
-import { flushAsync } from '@matterbridge/test-utils';
+import { flushAsync, getFreePort } from '@matterbridge/test-utils';
 import { HOMEDIR, loggerLogSpy, loggerWarnSpy, originalProcessArgv, setDebug, setupTest } from '@matterbridge/test-utils/vitest/setup';
 import { BroadcastServer } from '@matterbridge/thread/server';
 import { type ApiMatter, plg, type WorkerMessage } from '@matterbridge/types';
@@ -33,6 +33,7 @@ import type { MockedFunction } from 'vitest';
 
 import { Matterbridge } from '../src/matterbridge.js';
 import { MatterbridgeEndpoint } from '../src/matterbridgeEndpoint.js';
+import { MetricsServer } from '../src/metrics.js';
 import { closeMdnsInstance, destroyInstance } from './vitestUtils.js';
 
 // Spy on BroadcastServer methods (inlined: test-utils cannot depend on core)
@@ -254,6 +255,120 @@ describe('Matterbridge', () => {
       expect(lifecycleSpy).toHaveBeenCalledTimes(1);
     } finally {
       lifecycleSpy.mockRestore();
+    }
+  });
+
+  test('should keep native metrics opt-in and isolate configuration and listener failures', async () => {
+    const base = { name: 'test', type: 'DynamicPlatform', version: '1.0.0', debug: false, unregisterOnShutdown: false };
+    await matterbridge.startMetrics(base);
+    await matterbridge.startMetrics({ ...base, metrics_enabled: false, metrics_port: -1 });
+    expect((matterbridge as any).metrics).toBeUndefined();
+    const argv = [...process.argv];
+    process.argv.push('--experimental-backend');
+    await matterbridge.startMetrics({ ...base, metrics_enabled: true });
+    expect(matterbridge.getPlatformMatterbridge().supportsNativeMetrics).toBe(false);
+    expect((matterbridge as any).metrics).toBeUndefined();
+    process.argv = argv;
+    await matterbridge.startMetrics({ ...base, metrics_enabled: true, metrics_port: 'invalid' });
+    await matterbridge.startMetrics({ ...base, metrics_enabled: true, metrics_bind: 'not-an-ip' });
+    expect((matterbridge as any).metrics).toBeUndefined();
+    const failing = vi.spyOn(MetricsServer.prototype, 'start').mockRejectedValueOnce(new Error('diagnostics only'));
+    await matterbridge.startMetrics({ ...base, metrics_enabled: true });
+    expect((matterbridge as any).metrics).toBeUndefined();
+    failing.mockRestore();
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    const delayedFailure = vi.spyOn(MetricsServer.prototype, 'start').mockReturnValue(promise);
+    try {
+      const attempts = [matterbridge.startMetrics({ ...base, metrics_enabled: true }), matterbridge.startMetrics({ ...base, metrics_enabled: true })];
+      await flushAsync();
+      resolve(false);
+      await Promise.all(attempts);
+      expect(delayedFailure).toHaveBeenCalledTimes(1);
+      expect((matterbridge as any).metrics).toBeUndefined();
+    } finally {
+      resolve(false);
+      delayedFailure.mockRestore();
+    }
+    const port = await getFreePort();
+    const config = { ...base, metrics_enabled: true, metrics_port: port };
+    await Promise.all([matterbridge.startMetrics(config), matterbridge.startMetrics(config)]);
+    await matterbridge.startMetrics({ ...config, metrics_port: port + 1 });
+    const response = await fetch(`http://127.0.0.1:${port}/metrics`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('matterbridge_collection_success 1');
+    // The listener stays core-owned; later normal cleanup in this suite closes it.
+  });
+
+  test('should aggregate live controller sessions while keeping runtime identities out of metrics', async () => {
+    const node = {
+      lifecycle: { isOnline: true },
+      state: {
+        sessions: {
+          sessions: {
+            a: { isPeerActive: true, fabric: { fabricIndex: 1 }, numberOfActiveSubscriptions: 2 },
+            b: { isPeerActive: true, fabric: { fabricIndex: 1 }, numberOfActiveSubscriptions: 3 },
+            c: { isPeerActive: false, fabric: { fabricIndex: 1 }, numberOfActiveSubscriptions: 8 },
+            d: { isPeerActive: true, numberOfActiveSubscriptions: 0 },
+          },
+        },
+        commissioning: { fabrics: { 1: { fabricIndex: 1 }, 2: { fabricIndex: 2 } } },
+      },
+    };
+    const oldNode = matterbridge.serverNode;
+    (matterbridge as any).serverNode = node;
+    const plugins = vi.spyOn(matterbridge.plugins, 'array').mockReturnValue([
+      {
+        name: 'good',
+        enabled: true,
+        loaded: true,
+        started: true,
+        configured: true,
+        registeredDevices: 1,
+        configJson: { metrics_enabled: true },
+        platform: {
+          getConnectionHealth: (): undefined => {
+            return;
+          },
+        },
+        serverNode: node,
+      },
+      { name: 'failed', error: true, configJson: { metrics_enabled: true } },
+      { name: 'disabled' },
+    ] as any);
+    const devices = vi.spyOn(matterbridge.devices, 'array').mockReturnValue([{ serverNode: node }] as any);
+    try {
+      const data = (matterbridge as any).getMetricsSnapshot();
+      expect(data.nodes).toHaveLength(1);
+      expect(data.nodes[0].fabrics).toEqual([
+        { controller: 'fabric-1', vendor: '', sessions: 2, subscriptions: 5 },
+        { controller: 'fabric-2', vendor: '', sessions: 0, subscriptions: 0 },
+      ]);
+      expect(data.plugins[0].ready).toBe(true);
+      expect(data.plugins[1].ready).toBe(false);
+      expect(data.plugins[1].exports).toBe(0);
+      const first = { ...node, id: 'private-node-alpha', lifecycle: { isOnline: false } };
+      const second = { ...node, id: 'private-node-beta', lifecycle: { isOnline: true } };
+      devices.mockReturnValue([{ serverNode: first }, { serverNode: second }] as any);
+      const before = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      devices.mockReturnValue([{ serverNode: second }, { serverNode: first }] as any);
+      const after = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      expect(after).toEqual(before);
+      expect(JSON.stringify(after)).not.toContain('private-node');
+      plugins.mockReturnValue([
+        { name: 'alpha', serverNode: first },
+        { name: 'beta', serverNode: second },
+      ] as any);
+      const pluginBefore = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      plugins.mockReturnValue([
+        { name: 'beta', serverNode: second },
+        { name: 'alpha', serverNode: first },
+      ] as any);
+      const pluginAfter = Object.fromEntries((matterbridge as any).getMetricsSnapshot().nodes.map((n: { node: string; online: boolean }) => [n.node, n.online]));
+      expect(pluginAfter).toEqual(pluginBefore);
+    } finally {
+      plugins.mockRestore();
+      devices.mockRestore();
+      matterbridge.serverNode = oldNode;
     }
   });
 
